@@ -57,7 +57,15 @@ extern "C" {
 #define ff_const59 const
 #endif
 
+#if LIBAVCODEC_VERSION_MAJOR >= 63
+#define AVCODEC_63_IMPORTS(X) \
+	X(avcodec_get_supported_config)
+#else
+#define AVCODEC_63_IMPORTS(X)
+#endif
+
 #define VISIT_AVCODEC_IMPORTS(X) \
+	AVCODEC_63_IMPORTS(X) \
 	X(avcodec_find_encoder_by_name) \
 	X(avcodec_find_encoder) \
 	X(avcodec_alloc_context3) \
@@ -229,6 +237,44 @@ VISIT_AVUTIL_IMPORTS(DECLARE_IMPORT);
 VISIT_SWSCALE_IMPORTS(DECLARE_IMPORT);
 VISIT_SWRESAMPLE_IMPORTS(DECLARE_IMPORT);
 #undef DECLARE_IMPORT
+
+#if LIBAVCODEC_VERSION_MAJOR >= 63
+static bool GetCodecPixelFormats(const AVCodec* codec, const AVPixelFormat** pix_fmts)
+{
+	*pix_fmts = nullptr;
+	const void* configs = nullptr;
+	const int res = wrap_avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &configs, nullptr);
+	if (res < 0)
+		return false;
+
+	*pix_fmts = static_cast<const AVPixelFormat*>(configs);
+	return true;
+}
+
+static bool GetCodecSampleFormats(const AVCodec* codec, const AVSampleFormat** sample_fmts)
+{
+	*sample_fmts = nullptr;
+	const void* configs = nullptr;
+	const int res = wrap_avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &configs, nullptr);
+	if (res < 0)
+		return false;
+
+	*sample_fmts = static_cast<const AVSampleFormat*>(configs);
+	return true;
+}
+#else
+static bool GetCodecPixelFormats(const AVCodec* codec, const AVPixelFormat** pix_fmts)
+{
+	*pix_fmts = codec->pix_fmts;
+	return true;
+}
+
+static bool GetCodecSampleFormats(const AVCodec* codec, const AVSampleFormat** sample_fmts)
+{
+	*sample_fmts = codec->sample_fmts;
+	return true;
+}
+#endif
 
 // We could refcount this, but really, may as well just load it and pay the cost once.
 // Not like we need to save a few megabytes of memory...
@@ -454,14 +500,22 @@ bool GSCapture::BeginCapture(float fps, GSVector2i recommendedResolution, float 
 		// Default to NV12 if not overridden by the user
 		const AVPixelFormat preferred_sw_pix_fmt = GSConfig.VideoCaptureFormat.empty() ? AV_PIX_FMT_NV12 : static_cast<AVPixelFormat>(std::stoi(GSConfig.VideoCaptureFormat));
 		AVPixelFormat sw_pix_fmt = preferred_sw_pix_fmt;
-		if (vcodec->pix_fmts)
+		const AVPixelFormat* pix_fmts = nullptr;
+		if (!GetCodecPixelFormats(vcodec, &pix_fmts))
 		{
-			sw_pix_fmt = vcodec->pix_fmts[0];
-			for (u32 i = 0; vcodec->pix_fmts[i] != AV_PIX_FMT_NONE; i++)
+			Console.Error("Failed to get supported video codec pixel formats.");
+			InternalEndCapture(lock);
+			return false;
+		}
+
+		if (pix_fmts)
+		{
+			sw_pix_fmt = pix_fmts[0];
+			for (u32 i = 0; pix_fmts[i] != AV_PIX_FMT_NONE; i++)
 			{
-				if (vcodec->pix_fmts[i] == preferred_sw_pix_fmt)
+				if (pix_fmts[i] == preferred_sw_pix_fmt)
 				{
-					sw_pix_fmt = vcodec->pix_fmts[i];
+					sw_pix_fmt = pix_fmts[i];
 					break;
 				}
 			}
@@ -685,8 +739,16 @@ bool GSCapture::BeginCapture(float fps, GSVector2i recommendedResolution, float 
 		wrap_av_channel_layout_default(&s_audio_codec_context->ch_layout, AUDIO_CHANNELS);
 #endif
 
-		bool supports_format = false;
-		for (const AVSampleFormat* p = acodec->sample_fmts; *p != AV_SAMPLE_FMT_NONE; p++)
+		const AVSampleFormat* sample_fmts = nullptr;
+		if (!GetCodecSampleFormats(acodec, &sample_fmts))
+		{
+			Console.Error("Failed to get supported audio codec sample formats.");
+			InternalEndCapture(lock);
+			return false;
+		}
+
+		bool supports_format = (sample_fmts == nullptr);
+		for (const AVSampleFormat* p = sample_fmts; p && *p != AV_SAMPLE_FMT_NONE; p++)
 		{
 			if (*p == s_audio_codec_context->sample_fmt)
 			{
@@ -697,7 +759,8 @@ bool GSCapture::BeginCapture(float fps, GSVector2i recommendedResolution, float 
 		if (!supports_format)
 		{
 			Console.WriteLn(fmt::format("Audio codec '{}' does not support float samples, using default.", acodec->name));
-			s_audio_codec_context->sample_fmt = acodec->sample_fmts[0];
+			if (sample_fmts)
+				s_audio_codec_context->sample_fmt = sample_fmts[0];
 			s_swr_context = wrap_swr_alloc();
 			if (!s_swr_context)
 			{
@@ -1533,15 +1596,16 @@ GSCapture::FormatList GSCapture::GetVideoFormatList(const char* codec)
 	}
 
 	// rawvideo doesn't have a list of formats.
-	if (v_codec->pix_fmts == nullptr)
+	const AVPixelFormat* pix_fmts = nullptr;
+	if (!GetCodecPixelFormats(v_codec, &pix_fmts) || pix_fmts == nullptr)
 	{
-		Console.Error("(GetVideoFormatList) v_codec->pix_fmts is null.");
+		Console.Error("(GetVideoFormatList) pix_fmts is null.");
 		return ret;
 	}
 
-	for (int i = 0; v_codec->pix_fmts[i] != AVPixelFormat::AV_PIX_FMT_NONE; i++)
+	for (int i = 0; pix_fmts[i] != AVPixelFormat::AV_PIX_FMT_NONE; i++)
 	{
-		ret.emplace_back(v_codec->pix_fmts[i], wrap_av_get_pix_fmt_name(v_codec->pix_fmts[i]));
+		ret.emplace_back(pix_fmts[i], wrap_av_get_pix_fmt_name(pix_fmts[i]));
 	}
 
 	return ret;
